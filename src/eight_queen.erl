@@ -7,7 +7,7 @@
 perms([]) ->
     [[]];
 perms(L) ->
-    [[H | T] || H <- L, T <- perms(L -- [H])].
+    [[H | T] || H <- L, T <- perms([L -- [H]])].
 %%perms([]) ->[[]];
 %%perms(L) ->
 %% [[H | T] || H <- L, T <- perms(L -- [H]), attack_range(H,T) == []].
