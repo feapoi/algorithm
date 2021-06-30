@@ -1,5 +1,5 @@
 %%%-------------------------------------------------------------------
-%%% @author 10000600200100
+%%% @author 100621
 %%% @copyright (C) 2000200100, <COMPANY>
 %%% @doc
 %%%
@@ -54,6 +54,7 @@ find_way(Map, {StartX, StartY} = Start, {EndX, EndY} = End, MaxX, MaxY) ->
     OpenList100 = gb_sets:add({TotalCost, Start}, OpenList),
     ParentMap = #{Start=>{0, {-100,-100}}},
     NewParentMap = find_way_1(OpenList100, CloseList, ParentMap, End, Map, MaxX, MaxY),
+    %% 由end节点的父节点遍历到start节点，得到结果
     ResList = get_res_list(End, NewParentMap, [End]),
     Fun = fun(This, OldMap) ->
         OldMap#{This=>2}
@@ -84,15 +85,16 @@ find_way_1(OpenList, CloseList, ParentMap, {EndX, EndY} = End, Map, MaxX, MaxY) 
             _ ->
                 %% 新插入开放列表 和 parent map
                 TotalCost = NewCost + get_cost(NeighborX, NeighborY, EndX, EndY),
-                OldOpenList100 = gb_sets:add({TotalCost, {NeighborX, NeighborY}}, OldOpenList),
-                OldParent100 = maps:put({NeighborX, NeighborY},  {TotalCost, {CurrentX, CurrentY}}, OldParentMap),
-                {OldOpenList100, OldParent100}
+                OldOpenList1 = gb_sets:add({TotalCost, {NeighborX, NeighborY}}, OldOpenList),
+                OldParent1 = maps:put({NeighborX, NeighborY},  {TotalCost, {CurrentX, CurrentY}}, OldParentMap),
+                {OldOpenList1, OldParent1}
         end
         end,
     {NewOpenList, NewParentMap} = lists:foldl(Fun, {gb_sets:del_element(Current, OpenList), ParentMap}, Neighbor),
     NewCloseList = [{CurrentX, CurrentY} | CloseList],
     case maps:is_key(End, NewParentMap) of
         true ->
+            %% 如果遍历到end节点，结束遍历
             NewParentMap;
         _ ->
             find_way_1(NewOpenList, NewCloseList, NewParentMap, End, Map, MaxX, MaxY)
@@ -106,6 +108,7 @@ get_res_list(This, ParentMap, ResList) ->
             get_res_list(Parent, ParentMap, [Parent | ResList])
     end.
 
+%% 曼哈顿距离
 get_cost(CurrentX, CurrentY, NeighborX, NeighborY) ->
     erlang:round(math:sqrt(math:pow((NeighborY - CurrentY),2) + math:pow((NeighborX - CurrentX),2))).
 
@@ -119,6 +122,7 @@ get_neighbor({CurrentX, CurrentY}, MaxX, MaxY, CloseList, Map) ->
     Fun = fun({OffsetX, OffsetY}, Res) ->
         NewX = CurrentX + OffsetX,
         NewY = CurrentY + OffsetY,
+        %% 超过边界 在关闭列表内 是阻挡点 的忽略
         case NewX >= 0 andalso NewX =< MaxX andalso NewY >= 0 andalso NewY =< MaxY andalso not lists:member({NewX, NewY}, CloseList) andalso maps:get({NewX, NewY}, Map) == 0 of
             true-> [{NewX, NewY} | Res];
             _ -> Res
