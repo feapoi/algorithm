@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/suanfa.iml" filepath="$PROJECT_DIR$/suanfa.iml" />
+      <module fileurl="file://$PROJECT_DIR$/erl_algorithm.iml" filepath="$PROJECT_DIR$/erl_algorithm.iml" />
     </modules>
   </component>
 </project>

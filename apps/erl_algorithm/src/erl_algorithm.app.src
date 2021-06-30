@@ -1,0 +1,19 @@
+%%%-------------------------------------------------------------------
+%%% @author 100621
+%%% @copyright (C) 2021, <COMPANY>
+%%% @doc
+%%%
+%%% @end
+%%% Created : 30. 6月 2021 15:00
+%%%-------------------------------------------------------------------
+{application, erl_algorithm, [
+    {description, ""},
+    {vsn, "1"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {mod, {erl_algorithm_app, []}},
+    {env, []}
+]}.
