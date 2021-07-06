@@ -252,15 +252,18 @@ send(Kcp, Buffer) ->
         _ ->
             N = erlang:length(SndQueueReverse),
             {SndQueueReverse1, Buffer1} =
+                %% 判断是否有未发送的消息
+                %% 此处只判定snd_queue，因为snd_buf中可能是已经发送，只不过未确认而没有删除的记录
                 case N > 0 of
                     true ->
-                        [Seg | SndQueueReverseO] = SndQueueReverse,
+                        [Seg | SndQueueReverseO] = SndQueueReverse,  %% 将最后一条记录取出
                         DataLen = erlang:byte_size(Seg#segment.data),
                         BufferLen = erlang:byte_size(Buffer),
+                        %% 如果还有剩余空间
                         case DataLen < Kcp#kcp.mss of
                             true ->
-                                Capacity = Kcp#kcp.mss - DataLen,
-                                Extend = ?IF(BufferLen < Capacity, BufferLen, Capacity),
+                                Capacity = Kcp#kcp.mss - DataLen,   %% 获取剩余空间
+                                Extend = ?IF(BufferLen < Capacity, BufferLen, Capacity),    %% 初始化扩展大小，默认是全部占用，如果新数据小于剩余空间，则设置扩展大小为新数据长度
 
                                 <<Add2Seg:Extend, OtherBuffer/bytes>> = Buffer,
                                 {[Seg#segment{data = <<(Seg#segment.data)/bytes, Add2Seg/bytes>>} | SndQueueReverseO], OtherBuffer};
