@@ -245,15 +245,71 @@ send(Kcp, <<>>) -> %% 如果数据为空，直接退出
 send(Kcp, Buffer) ->
     %% append to previous segment in streaming mode (if possible)
     %% 如果是流模式，则判断是否与现有Segment合并
+    SndQueueReverse = lists:reverse(Kcp#kcp.snd_queue),
     case Kcp#kcp.stream of
-        0 -> 1;
+        0 ->
+            {SndQueueReverse, Buffer};
         _ ->
+            N = erlang:length(SndQueueReverse),
+            {SndQueueReverse1, Buffer1} =
+                case N > 0 of
+                    true ->
+                        [Seg | SndQueueReverseO] = SndQueueReverse,
+                        DataLen = erlang:byte_size(Seg#segment.data),
+                        BufferLen = erlang:byte_size(Buffer),
+                        case DataLen < Kcp#kcp.mss of
+                            true ->
+                                Capacity = Kcp#kcp.mss - DataLen,
+                                Extend = ?IF(BufferLen < Capacity, BufferLen, Capacity),
 
-    end
-    1.
+                                <<Add2Seg:Extend, OtherBuffer/bytes>> = Buffer,
+                                {[Seg#segment{data = <<(Seg#segment.data)/bytes, Add2Seg/bytes>>} | SndQueueReverseO], OtherBuffer};
+                            _ ->
+                                {SndQueueReverse, Buffer}
+                        end;
+                    _ ->
+                        {SndQueueReverse, Buffer}
+                end,
+            case erlang:byte_size(Buffer1) of
+                0 ->
+                    %% return 0
+                    {Kcp, 0};
+                BufferLen1 ->
+                    Count =
+                        case BufferLen1 =< Kcp#kcp.mss of
+                            true ->
+                                1;
+                            _ ->
+                                (BufferLen1 + Kcp#kcp.mss - 1) div Kcp#kcp.mss
+                        end,
+                    case Count > 255 of
+                        %% return 2
+                        true -> {Kcp, -2};
+                        _ ->
+                            Count1 = ?IF(Count == 0, 1, Count),
+                            loop_seg(0, Count1, BufferLen1, Buffer1, Kcp, SndQueueReverse1),
+                            {Kcp#kcp{snd_queue = lists:reverse(SndQueueReverse1)}, 0}
+                    end
+            end
+    end.
 
-
+loop_seg(I, Count, _BufferLen, Buffer, _Kcp, SndQueueReverse) when I + 1 >= Count ->
+    {Buffer, SndQueueReverse};
+loop_seg(I, Count, BufferLen, Buffer, Kcp, SndQueueReverse) ->
+    Size  = min(BufferLen, Kcp#kcp.mss),
+    %% init seg
+    %% todo
+    Seg = #segment{},
+    <<Add:Size, OtherBuffer/bytes>> = Buffer,
+    Seg1 = Seg#segment{
+        data = Add
+        ,frg = ?IF(Kcp#kcp.stream == 0, Count - I - 1, 0)
+    },
+    SndQueueReverse1 = [Seg1 | SndQueueReverse],
+    loop_seg(I + 1, Count, BufferLen - Size, OtherBuffer, Kcp, SndQueueReverse1).
 %%======================================================================================================================
+
+
 
 
 %%======================================================================================================================
@@ -506,6 +562,19 @@ encode(Seg, Ptr) ->
         ,(erlang:length(Seg#segment.data)):32/little-integer
     >>.
 
+decode(Data) ->
+    <<
+        Conv:32/little-integer
+        ,Cmd:8/little-integer
+        ,Frg:8/little-integer
+        ,Wnd:16/little-integer
+        ,Ts:32/little-integer
+        ,Sn:32/little-integer
+        ,Una:32/little-integer
+        ,Len:32/little-integer
+    >> = Data,
+    {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len}.
+
 %% makeSpace makes room for writing
 make_space(Space, Ptr, Mtu) ->
     Size = erlang:byte_size(Ptr),
@@ -529,6 +598,34 @@ wnd_unused(Kcp) ->
 out_put(Buffer) ->
     111.
 %%======================================================================================================================
+
+
+%%======================================================================================================================
+%% Input
+%%======================================================================================================================
+%%// Input a packet into kcp state machine.
+%%//
+%%// 'regular' indicates it's a real data packet from remote, and it means it's not generated from ReedSolomon
+%%// codecs.
+%%//
+%%// 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
+%%/**
+%% * 6.1 数据发送给接受端，接受端通过input进行接受，并解包receive buf，有确认的数据包recv_buf-->recv_queue
+%% * 1. 解包
+%% * 2. 确认是否有新的确认块，确认块需要重recv_buf-->recv_queue
+%% * 3. 更新相关参数，主要是是否有确认过未删除，recv_buf，recv_queue的尺寸
+%% */
+input(Kcp, Data, Regular, AckNoDelay) ->
+    SndUna = Kcp#kcp.snd_una,
+    case erlang:byte_size(Data) < ?IKCP_OVERHEAD of
+        true ->
+            {Kcp, -1};
+        _ ->
+
+    end,
+    1.
+%%======================================================================================================================
+
 
 
 %%======================================================================================================================
@@ -629,5 +726,4 @@ loop_rcv_queue([#segment{data = Data, frg = Frg} | RcvQueue], Len) ->
         _ ->
             loop_rcv_queue(RcvQueue, NewLen)
     end.
-
 %%======================================================================================================================
