@@ -265,6 +265,8 @@ send(Kcp, Buffer) ->
                                 Capacity = Kcp#kcp.mss - DataLen,   %% 获取剩余空间
                                 Extend = ?IF(BufferLen < Capacity, BufferLen, Capacity),    %% 初始化扩展大小，默认是全部占用，如果新数据小于剩余空间，则设置扩展大小为新数据长度
 
+                                %% grow slice, the underlying cap is guaranteed to
+                                %% be larger than kcp.mss
                                 <<Add2Seg:Extend, OtherBuffer/bytes>> = Buffer,
                                 {[Seg#segment{data = <<(Seg#segment.data)/bytes, Add2Seg/bytes>>} | SndQueueReverseO], OtherBuffer};
                             _ ->
@@ -273,23 +275,29 @@ send(Kcp, Buffer) ->
                     _ ->
                         {SndQueueReverse, Buffer}
                 end,
+            %% 如果buffer剩余的内容长度为0，表示已经完成数据的写入Segment的过程，结束
             case erlang:byte_size(Buffer1) of
                 0 ->
                     %% return 0
                     {Kcp, 0};
                 BufferLen1 ->
                     Count =
+                        %% 以下说明中，无论是已经合并一部分到上一个Segment还是没有合并的情况，统统称呼为新数据
+                        %% 如果新数据小于一个新Segment的数据长度
                         case BufferLen1 =< Kcp#kcp.mss of
                             true ->
                                 1;
                             _ ->
                                 (BufferLen1 + Kcp#kcp.mss - 1) div Kcp#kcp.mss
                         end,
+                    %% 如果新增加的输入大于255个，直接表示无法发送  254*(1400-24)/1024=344KB的数据
+                    %% 想要多发数据，只能通过MTU进行设定
                     case Count > 255 of
                         %% return 2
                         true -> {Kcp, -2};
                         _ ->
                             Count1 = ?IF(Count == 0, 1, Count),
+                            %% 遍历Segment数量
                             loop_seg(0, Count1, BufferLen1, Buffer1, Kcp, SndQueueReverse1),
                             {Kcp#kcp{snd_queue = lists:reverse(SndQueueReverse1)}, 0}
                     end
@@ -299,15 +307,20 @@ send(Kcp, Buffer) ->
 loop_seg(I, Count, _BufferLen, Buffer, _Kcp, SndQueueReverse) when I + 1 >= Count ->
     {Buffer, SndQueueReverse};
 loop_seg(I, Count, BufferLen, Buffer, Kcp, SndQueueReverse) ->
+    %% 判断剩余的buffer长度是否还是大于Segment存放数据的空间
     Size  = min(BufferLen, Kcp#kcp.mss),
     %% init seg
+    %% 创建Segment
     %% todo
     Seg = #segment{},
     <<Add:Size, OtherBuffer/bytes>> = Buffer,
     Seg1 = Seg#segment{
+        %% 将数据存放到新的Segment中
         data = Add
+        %% message mode 如果是消息模式，则需要将frg标记号码，从大到小,stream mode	如果是流模式，就不需要
         ,frg = ?IF(Kcp#kcp.stream == 0, Count - I - 1, 0)
     },
+    %% 将Segment存放到snd_queue中去
     SndQueueReverse1 = [Seg1 | SndQueueReverse],
     loop_seg(I + 1, Count, BufferLen - Size, OtherBuffer, Kcp, SndQueueReverse1).
 %%======================================================================================================================
@@ -575,8 +588,9 @@ decode(Data) ->
         ,Sn:32/little-integer
         ,Una:32/little-integer
         ,Len:32/little-integer
+        ,Other/bytes
     >> = Data,
-    {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len}.
+    {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len, Other}.
 
 %% makeSpace makes room for writing
 make_space(Space, Ptr, Mtu) ->
@@ -627,6 +641,171 @@ input(Kcp, Data, Regular, AckNoDelay) ->
 
     end,
     1.
+
+loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
+    {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len, Data1} = decode(Data),
+    case Conv =/= Kcp#kcp.conv of
+        %% return -1
+        true -> -1;
+        _ ->
+            case erlang:byte_size(Data1) < Len of
+                %% return -2
+                true -> -2;
+                _ ->
+                    {Flag1, Latest1, Kcp0} =
+                        case lists:member(Cmd, [?IKCP_CMD_PUSH, ?IKCP_CMD_ACK, ?IKCP_CMD_WASK, ?IKCP_CMD_WINS]) of
+                            true ->
+                                %% only trust window updates from regular packets. i.e: latest update
+                                Kcp1 = ?IF(Regular, Kcp#kcp{rmt_wnd = Wnd}, Kcp),
+                                {NewSndBuf , Count} = parse_una(Kcp1#kcp.snd_buf, Una, 0),
+                                Kcp2 = Kcp1#kcp{snd_buf = NewSndBuf},
+                                WindowSlides1 = ?IF(Count > 0, true, WindowSlides),
+                                Kcp3 = shrink_buf(Kcp2),
+                                case Cmd of
+                                    ?IKCP_CMD_ACK ->
+                                        Kcp31 = parse_ack(Kcp3, Sn),
+                                        Kcp32 = parse_fast_ack(Kcp31, Sn, Ts),
+                                        {Flag bxor 1, Ts, Kcp32};
+                                    ?IKCP_CMD_PUSH ->
+                                        case Sn - Kcp#kcp.rcv_nxt + Kcp#kcp.rcv_wnd < 0 of
+                                            true ->
+                                                Kcp1 = ack_push(Kcp, Sn, Ts),
+                                                case Sn - Kcp#kcp.rcv_nxt of
+                                                    true ->
+                                                        ;
+                                                    _ ->
+
+                                                end;
+                                            _ ->
+
+                                        end;
+                                    ?IKCP_CMD_WASK ->
+                                        ;
+                                    ?IKCP_CMD_WINS ->
+                                        ;
+                                    %% return -3
+                                    _ -> -3
+                                end,
+                                InSegs,
+                                <<_:Len, Data3/bytes>> = Data1;
+                            _ ->
+                                %% return -3
+                                -3
+                        end
+            end
+    end.
+
+parse_data(Kcp, Seg) ->
+    Sn = Seg#segment.sn,
+    case Sn - Kcp#kcp.rcv_nxt - Kcp#kcp.rcv_wnd >= 0 orelse Sn - Kcp#kcp.rcv_nxt < 0 of
+        true ->
+            true;
+        _ ->
+            N = erlang:length(Kcp#kcp.rcv_buf) - 1,
+            InsertIdx = 0,
+            Repeat = false,
+            {Repeat1, InsertIdx1} = loop_parse_data_1(N, Kcp#kcp.rcv_buf, Sn, Repeat, InsertIdx),
+            case not Repeat1 of
+                true ->
+                    case InsertIdx1 == N + 1 of
+                        true ->
+                            Kcp#kcp{rcv_buf = Kcp#kcp.rcv_buf ++ [Seg]};
+                        _ ->
+                            {Head, Tail} = lists:split(InsertIdx1, Kcp#kcp.rcv_buf),
+                            Kcp#kcp{rcv_buf = Head ++ [Seg] ++ Tail}
+                    end;
+
+
+                _ ->
+
+            end
+    end.
+
+loop_parse_data_1(I, [], Sn, Repeat, InsertIdx) ->
+    {Repeat, InsertIdx};
+loop_parse_data_1(I, [Seg | RcvBuf], Sn, Repeat, InsertIdx) ->
+    case Seg#segment.sn == Sn of
+        true ->{true, InsertIdx};
+        _ ->
+            case Sn - Seg#segment.sn > 0 of
+                true ->
+                    {Repeat, I + 1};
+                _ ->
+                    loop_parse_data_1(I - 1, RcvBuf, Sn, Repeat, InsertIdx)
+            end
+    end.
+
+ack_push(Kcp, Sn, Ts) ->
+    Kcp#kcp{acklist = Kcp#kcp.acklist ++ [{Sn, Ts}]}.
+
+parse_fast_ack(Kcp, Sn, Ts) ->
+    case Sn - Kcp#kcp.snd_una < 0 orelse Sn - Kcp#kcp.snd_nxt >= 0 of
+        true ->Kcp;
+        _ ->
+            NewSndBuf = loop_parse_fast_ack(Kcp#kcp.snd_buf, [], Sn, Ts),
+            Kcp#kcp{snd_buf = NewSndBuf}
+    end.
+loop_parse_fast_ack([], Res, _Sn, _Ts) ->
+    lists:reverse(Res);
+loop_parse_fast_ack([Seg | SndBuf], Res, Sn, Ts) ->
+    case Sn - Seg#segment.sn < 0 of
+        true->
+            lists:reverse(Res) ++ [Seg | SndBuf];
+        _ ->
+            case Sn =/= Seg#segment.sn andalso Seg#segment.ts - Ts =< 0 of
+                true ->
+                    loop_parse_fast_ack(SndBuf, Res, Sn, [Seg#segment{fastack = Seg#segment.fastack + 1} | Ts]) ;
+                _ ->
+                    loop_parse_fast_ack(SndBuf, Res, Sn, [Seg | Ts])
+            end
+    end.
+
+parse_ack(Kcp, Sn) ->
+    case Sn - Kcp#kcp.snd_una < 0 orelse Sn - Kcp#kcp.snd_nxt >= 0 of
+        true -> Kcp;
+        _ ->
+            Del = loop_parse_ack(Kcp#kcp.snd_buf, Sn),
+            Kcp#kcp{snd_buf = Kcp#kcp.snd_buf -- Del}
+    end.
+
+loop_parse_ack([], Sn) ->
+    [];
+loop_parse_ack([Seg | SndBuf], Sn) ->
+    case Sn =:= Seg#segment.sn of
+        true->
+            %% kcp.delSegment(seg),
+            [Seg];
+        _ ->
+            case Sn - Seg#segment.sn < 0 of
+                true ->
+                    [];
+                _ ->
+                    loop_parse_ack(SndBuf, Sn)
+            end
+    end.
+
+
+
+shrink_buf(Kcp) ->
+    case erlang:byte_size(Kcp#kcp.snd_buf) > 0 of
+        true ->
+            [Seg | _] = Kcp#kcp.snd_buf,
+            Kcp#kcp{snd_una = Seg#segment.una};
+        _ ->
+            Kcp#kcp{snd_una = Kcp#kcp.snd_nxt}
+    end.
+
+parse_una([], _Una, Count) ->
+    {[], Count};
+parse_una([Seg | SndBuf], Una, Count) ->
+    case Una - Seg#segment.sn > 0 of
+        true ->
+            %% kcp.delSegment(seg),
+            parse_una(SndBuf, Una, Count + 1) ;
+        _ ->
+            {[Seg | SndBuf], Count}
+    end.
+
 %%======================================================================================================================
 
 
