@@ -638,21 +638,94 @@ input(Kcp, Data, Regular, AckNoDelay) ->
         true ->
             {Kcp, -1};
         _ ->
+            {Kcp1, Flag, Latest, WindowSlides} = loop_decode(Data, Kcp, Regular, false, 0, 0, 0),
+            Kcp2 =
+                case Flag =/= 0 andalso Regular of
+                    true ->
+                        Current = ?CURRENT,
+                        case Current - Latest >= 0 of
+                            true ->
+                                update_ack(Kcp1, Current - Latest);
+                            _ ->
+                                Kcp1
+                        end;
+                    _ ->
+                        Kcp1
+                end,
+            Kcp3 =
+                case Kcp2#kcp.nocwnd == 0 of
+                    true->
+                        case Kcp2#kcp.snd_una - SndUna > 0 of
+                            true ->
+                                case Kcp2#kcp.cwnd < Kcp2#kcp.rmt_wnd of
+                                    true->
+                                        Mss = Kcp2#kcp.mss,
+                                        Kcp21 =
+                                            case Kcp2#kcp.cwnd < Kcp2#kcp.ssthresh of
+                                                true ->
+                                                    Kcp2#kcp{
+                                                        cwnd = Kcp2#kcp.cwnd + 1,
+                                                        incr = Kcp2#kcp.incr + Mss
+                                                    };
+                                                _ ->
+                                                    Kcp21 = ?IF(Kcp2#kcp.incr < Mss, Kcp2#kcp{incr = Mss}, Kcp2),
+                                                    Kcp22 = Kcp21#kcp{incr = Kcp21#kcp.incr + (Mss*Mss)/Kcp21#kcp.incr + (Mss / 16)},
+                                                    case (Kcp22#kcp.cwnd+1)*Mss =< Kcp22#kcp.incr of
+                                                        true ->
+                                                            case Mss > 0 of
+                                                                true ->
+                                                                    Kcp22#kcp{cwnd = (Kcp22#kcp.incr + Mss - 1) / Mss};
+                                                                _ ->
+                                                                    Kcp22#kcp{cwnd = Kcp22#kcp.incr + Mss - 1}
+                                                            end;
+                                                        _ -> Kcp22
+                                                    end
+                                            end,
+                                        ?IF(Kcp21#kcp.cwnd > Kcp21#kcp.rmt_wnd, Kcp21#kcp{cwnd = Kcp21#kcp.rmt_wnd}, Kcp21#kcp{incr =  Kcp21#kcp.rmt_wnd * Mss});
+                                    _ -> Kcp2
+                                end;
+                            _ -> Kcp2
+                        end;
+                    _ -> Kcp2
+                end,
+            if
+                WindowSlides ->
+                    flush(Kcp3, false);
+                AckNoDelay andalso length(Kcp3#kcp.acklist) > 0 ->
+                    flush(Kcp3, true);
+                true ->
+                    {Kcp3, 0}
+            end
+    end.
 
-    end,
-    1.
+update_ack(Kcp, Rtt) ->
+    Kcp1 =
+        case Kcp#kcp.rx_srtt == 0 of
+            true ->
+                Kcp#kcp{rx_srtt = Rtt, rx_rttvar = Rtt bsr 1};
+            _ ->
+                Delta = Rtt - Kcp#kcp.rx_srtt,
+                Kcp01 = Kcp#kcp{rx_srtt = Kcp#kcp.rx_srtt + Delta bsr 3},
+                Delta1 = ?IF(Delta < 0, -Delta, Delta),
+                case Rtt < Kcp01#kcp.rx_srtt - Kcp#kcp.rx_rttvar of
+                    true -> Kcp01#kcp{rx_rttvar = Kcp01#kcp.rx_rttvar + (Delta1 - Kcp01#kcp.rx_rttvar) bsr 5};
+                    _ -> Kcp01#kcp{rx_rttvar = Kcp01#kcp.rx_rttvar + (Delta1 - Kcp01#kcp.rx_rttvar) bsr 2}
+                end
+        end,
+    Rto = Kcp1#kcp.rx_srtt + max(Kcp1#kcp.interval, Kcp1#kcp.rx_rttvar bsl 2),
+    Kcp1#kcp{rx_rto = min(max(Kcp1#kcp.rx_minrto, Rto), ?IKCP_RTO_MAX)}.
 
 loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
     {Conv, Cmd, Frg, Wnd, Ts, Sn, Una, Len, Data1} = decode(Data),
     case Conv =/= Kcp#kcp.conv of
         %% return -1
-        true -> -1;
+        true -> {Flag, Ts, Kcp, WindowSlides};
         _ ->
             case erlang:byte_size(Data1) < Len of
                 %% return -2
-                true -> -2;
+                true -> {Flag, Ts, Kcp, WindowSlides};
                 _ ->
-                    {Flag1, Latest1, Kcp0} =
+                    {Flag1, Latest1, Kcp4} =
                         case lists:member(Cmd, [?IKCP_CMD_PUSH, ?IKCP_CMD_ACK, ?IKCP_CMD_WASK, ?IKCP_CMD_WINS]) of
                             true ->
                                 %% only trust window updates from regular packets. i.e: latest update
@@ -665,32 +738,43 @@ loop_decode(Data, Kcp, Regular, WindowSlides, InSegs, Flag, Latest) ->
                                     ?IKCP_CMD_ACK ->
                                         Kcp31 = parse_ack(Kcp3, Sn),
                                         Kcp32 = parse_fast_ack(Kcp31, Sn, Ts),
-                                        {Flag bxor 1, Ts, Kcp32};
+                                        {Flag bxor 1, Ts, Kcp32, WindowSlides1};
                                     ?IKCP_CMD_PUSH ->
                                         case Sn - Kcp#kcp.rcv_nxt + Kcp#kcp.rcv_wnd < 0 of
                                             true ->
                                                 Kcp1 = ack_push(Kcp, Sn, Ts),
                                                 case Sn - Kcp#kcp.rcv_nxt of
                                                     true ->
-                                                        ;
+                                                        Seg = #segment{
+                                                            conv = Conv
+                                                            ,cmd = Cmd
+                                                            ,frg = Frg
+                                                            ,wnd = Wnd
+                                                            ,ts = Ts
+                                                            ,sn = Sn
+                                                            ,una = Una
+                                                            ,data = lists:sublist(Data, Len)
+                                                        },
+                                                        {Kcp31, _} = parse_data(Kcp, Seg),
+                                                        {Flag, Latest, Kcp31, WindowSlides1};
                                                     _ ->
-
+                                                        {Flag, Latest, Kcp3, WindowSlides1}
                                                 end;
                                             _ ->
-
+                                                {Flag, Latest, Kcp3, WindowSlides1}
                                         end;
                                     ?IKCP_CMD_WASK ->
-                                        ;
+                                        {Flag, Latest, Kcp3#kcp{probe = Kcp3#kcp.probe bxor ?IKCP_ASK_TELL},WindowSlides1};
                                     ?IKCP_CMD_WINS ->
-                                        ;
+                                        {Flag, Latest, Kcp3, WindowSlides1};
                                     %% return -3
-                                    _ -> -3
+                                    _ -> {Flag, Latest, Kcp3, WindowSlides1}
                                 end,
-                                InSegs,
-                                <<_:Len, Data3/bytes>> = Data1;
+                                <<_:Len, Data3/bytes>> = Data1,
+                                loop_decode(Data3, Kcp4, Regular, WindowSlides1, InSegs + 1, Flag1, Latest1);
                             _ ->
                                 %% return -3
-                                -3
+                                {Flag, Latest, Kcp, WindowSlides}
                         end
             end
     end.
@@ -705,20 +789,31 @@ parse_data(Kcp, Seg) ->
             InsertIdx = 0,
             Repeat = false,
             {Repeat1, InsertIdx1} = loop_parse_data_1(N, Kcp#kcp.rcv_buf, Sn, Repeat, InsertIdx),
-            case not Repeat1 of
-                true ->
-                    case InsertIdx1 == N + 1 of
-                        true ->
-                            Kcp#kcp{rcv_buf = Kcp#kcp.rcv_buf ++ [Seg]};
-                        _ ->
-                            {Head, Tail} = lists:split(InsertIdx1, Kcp#kcp.rcv_buf),
-                            Kcp#kcp{rcv_buf = Head ++ [Seg] ++ Tail}
-                    end;
+            Kcp1 =
+                case not Repeat1 of
+                    true ->
+                        case InsertIdx1 == N + 1 of
+                            true ->
+                                Kcp#kcp{rcv_buf = Kcp#kcp.rcv_buf ++ [Seg]};
+                            _ ->
+                                {Head, Tail} = lists:split(InsertIdx1, Kcp#kcp.rcv_buf),
+                                Kcp#kcp{rcv_buf = Head ++ [Seg] ++ Tail}
+                        end;
+                    _ ->
+                        Kcp
+                end,
+            {NewRcvBuf, Kcp2, _Count, AddRcvQueue} = loop_parse_data_2(Kcp1#kcp.rcv_buf, 0, Kcp1, Kcp1#kcp.rcv_queue, []),
+            {Kcp2#kcp{rcv_buf = NewRcvBuf, rcv_queue = Kcp2#kcp.rcv_queue ++ lists:reverse(AddRcvQueue)}, Repeat1}
+    end.
 
-
-                _ ->
-
-            end
+loop_parse_data_2([], Count, Kcp, _RcvQueueLen, Res) ->
+    {[], Kcp, Count, Res};
+loop_parse_data_2([Seg | RcvBuf], Count, Kcp, RcvQueueLen, Res) ->
+    case Seg#segment.sn == Kcp#kcp.rcv_nxt andalso RcvQueueLen + Count < Kcp#kcp.rcv_wnd of
+        true ->
+            loop_parse_data_2(RcvBuf, Count + 1, Kcp#kcp{rcv_nxt = Kcp#kcp.rcv_nxt + 1}, RcvQueueLen, [Seg | Res]) ;
+        _ ->
+            {[Seg | RcvBuf], Kcp, Count, Res}
     end.
 
 loop_parse_data_1(I, [], Sn, Repeat, InsertIdx) ->
